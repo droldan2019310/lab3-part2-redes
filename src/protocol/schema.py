@@ -2,18 +2,21 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, timezone
+import json  # <-- para normalizar payload string JSON
 from src.utils.ids import generate_msg_id, generate_trace_id
 
 # Tipos permitidos en el protocolo "lsr"
 PacketType = Literal["hello", "info", "message"]
 
 class BasePacket(BaseModel):
-    proto: Literal["lsr"] = Field(default="lsr")
+    proto: Literal["lsr", "flooding"] = Field(default="lsr")  # admite ambos si quieres usar flooding
     type: PacketType
     from_: str = Field(alias="from", min_length=1)
     to: str
     ttl: int = Field(ge=0, le=64, default=5)  # 0 = descartable inmediatamente
-    headers: List[str] = Field(default_factory=list)  # trail anti-ciclos
+
+    # Acepta lista (tu formato) o dict con 'path' (formato externo)
+    headers: Union[List[str], Dict[str, Any]] = Field(default_factory=list)
     payload: Any = None
 
     # Metadatos de tracing
@@ -22,22 +25,31 @@ class BasePacket(BaseModel):
     trace_id: Optional[str] = None
 
     class Config:
-        # Permite usar "from" en input/output
-        populate_by_name = True
+        populate_by_name = True  # permite usar 'from'
         str_strip_whitespace = True
         validate_assignment = True
 
     @field_validator("headers")
     @classmethod
-    def _limit_headers(cls, v: List[str]) -> List[str]:
-        # Limitamos el tamaño del trail (e.g., 8 últimos)
-        return v[-8:] if len(v) > 8 else v
+    def _normalize_headers(cls, v):
+        """
+        Soporta:
+          - lista: ["A","B","C"] → recorte a 8
+          - dict: {"msg_id":"..","seq":9,"path":[...]} → usa 'path' si existe, recorte a 8
+        """
+        if isinstance(v, dict):
+            path = v.get("path", [])
+            if isinstance(path, list):
+                return path[-8:]
+            return []
+        if isinstance(v, list):
+            return v[-8:]
+        return []
 
     @field_validator("to")
     @classmethod
     def _normalize_to(cls, v: str) -> str:
-        # Permitimos "broadcast" o un destino (nodo o email-like)
-        if v.lower() == "broadcast":
+        if (v or "").lower() == "broadcast":
             return "broadcast"
         return v
 
@@ -55,14 +67,24 @@ class BasePacket(BaseModel):
     def with_appended_hop(self, node_id: str) -> "BasePacket":
         """Agrega mi id al final del trail y recorta si excede."""
         data = self.model_dump(by_alias=True)
-        headers = data.get("headers", []) or []
-        headers.append(node_id)
-        data["headers"] = headers[-8:]
+        hdrs = data.get("headers", []) or []
+
+        # si vinieron como dict, sacar 'path'
+        if isinstance(hdrs, dict):
+            hdrs = hdrs.get("path", [])
+        if not isinstance(hdrs, list):
+            hdrs = []
+
+        hdrs.append(node_id)
+        data["headers"] = hdrs[-8:]
         return PacketFactory.parse_obj(data)
 
     def seen_cycle(self, node_id: str) -> bool:
         """True si ya pasé por este node_id (detectar ciclo)."""
-        return node_id in (self.headers or [])
+        hdrs = self.headers
+        if isinstance(hdrs, dict):
+            hdrs = hdrs.get("path", [])
+        return isinstance(hdrs, list) and node_id in hdrs
 
 
 # Paquetes específicos (te permiten más validaciones si las necesitas)
@@ -80,8 +102,36 @@ class HelloPacket(BasePacket):
 
 class InfoPacket(BasePacket):
     type: Literal["info"]
-    # payload puede ser LSP o la “tabla hacia destinos” acordada
-    payload: Dict[str, Union[int, float]]
+    # payload puede ser LSP o la “tabla hacia destinos” acordada.
+    # Acepta dict o string JSON (de otros grupos).
+    payload: Union[Dict[str, Any], str]
+
+    @field_validator("payload")
+    @classmethod
+    def _normalize_info_payload(cls, v):
+        """
+        Soporta:
+          - dict directo: {"B":1,"D":1}
+          - dict con "neighbors": {"origin":"A","seq":9,"neighbors":{"B":1,"D":1}, ...}
+          - string JSON de cualquiera de los dos
+        """
+        # si viene como string JSON → parsear
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                return {}
+
+        # si no es dict a este punto → vacío
+        if not isinstance(v, dict):
+            return {}
+
+        # si trae 'neighbors' y es dict → usarlo como vista
+        if "neighbors" in v and isinstance(v["neighbors"], dict):
+            return dict(v["neighbors"])
+
+        # si ya es mapa destino->costo, devolver tal cual
+        return v
 
 
 class UserMessagePacket(BasePacket):
